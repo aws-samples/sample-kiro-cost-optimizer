@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Kiro user activity reports — contain real user data (email, UserId, ProfileId).
+# Downloaded locally for development only; never commit these.
+*.csv
+
+# Lambda invocation / test output
+response.json
+out.json
+*.tmp

@@ -1,0 +1,1386 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Complete Kiro Cost Optimizer stack: S3 bucket for reports, Lambda processor,
+  EventBridge scheduler, and SNS notifications.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Bucket Configuration
+        Parameters:
+          - UseExistingBucket
+          - BucketName
+          - ReportPrefix
+      - Label:
+          default: Kiro Configuration
+        Parameters:
+          - KiroProfileRegion
+      - Label:
+          default: Notification Configuration
+        Parameters:
+          - NotificationEmail
+          - NotificationFrequency
+
+Parameters:
+  UseExistingBucket:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: >
+      Set to "true" if you already have an S3 bucket with user activity
+      reports enabled. When true, provide the bucket name below — the stack
+      will NOT modify your existing bucket policy. You must manually add the
+      required policy statement (shown in the stack outputs after creation).
+      When false, a new bucket is created with the correct policy attached.
+
+  BucketName:
+    Type: String
+    Default: ""
+    Description: >
+      The S3 bucket name (no "/" needed). When UseExistingBucket is "true",
+      this must be the name of your existing bucket. When "false", this is
+      the name for the new bucket. If left empty and UseExistingBucket is
+      "false", CloudFormation generates a unique name automatically.
+
+  ReportPrefix:
+    Type: String
+    Default: "kiro-user-activity"
+    AllowedPattern: "^[a-zA-Z0-9!_.*'() -]+( [a-zA-Z0-9!_.*'() -]+)*$"
+    ConstraintDescription: >
+      Prefix must contain only valid S3 key characters. Spaces are allowed
+      between words but no leading/trailing spaces or consecutive spaces.
+    Description: >
+      The S3 prefix (subfolder) where Kiro writes the CSV reports (no "/"
+      needed). Kiro requires a prefix — the root of the bucket is not
+      supported.
+
+  KiroProfileRegion:
+    Type: String
+    AllowedValues:
+      - "us-east-1"
+      - "eu-central-1"
+    Default: "us-east-1"
+    Description: >
+      The AWS Region where your Kiro profile was installed.
+      Currently supported: us-east-1 and eu-central-1.
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive overage notifications
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+
+  NotificationFrequency:
+    Type: String
+    AllowedValues:
+      - "1"
+      - "7"
+      - "30"
+    Default: "7"
+    Description: >
+      How often the email notification Lambda runs:
+      "1" = daily, "7" = weekly (Mondays), "30" = monthly (1st of month).
+      All runs fire at 8 AM UTC.
+
+Mappings:
+  # Translates the NotificationFrequency parameter into an EventBridge cron.
+  FrequencyToCron:
+    "1":
+      # Every day at 8 AM UTC
+      Cron: "cron(0 8 * * ? *)"
+    "7":
+      # Every Monday at 8 AM UTC
+      Cron: "cron(0 8 ? * 2 *)"
+    "30":
+      # 1st of every month at 8 AM UTC
+      Cron: "cron(0 8 1 * ? *)"
+
+Conditions:
+  CreateNewBucket: !Equals [!Ref UseExistingBucket, "false"]
+  HasBucketName: !Not [!Equals [!Ref BucketName, ""]]
+
+Resources:
+  # ========================================================================
+  # S3 BUCKET
+  # ========================================================================
+  KiroReportBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateNewBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If [HasBucketName, !Ref BucketName, !Ref "AWS::NoValue"]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Prefix: !Sub "${ReportPrefix}/"
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+
+  KiroReportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateNewBucket
+    Properties:
+      Bucket: !Ref KiroReportBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: KiroUserActivityReportWrite
+            Effect: Allow
+            Principal:
+              Service: q.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub "arn:aws:s3:::${KiroReportBucket}/${ReportPrefix}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:codewhisperer:${KiroProfileRegion}:${AWS::AccountId}:*"
+
+  # ========================================================================
+  # DYNAMODB TABLE (daily per-user usage, accumulated across days)
+  # ========================================================================
+  UsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-usage-report"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: UserId
+          AttributeType: S
+        - AttributeName: Date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UserId
+          KeyType: HASH
+        - AttributeName: Date
+          KeyType: RANGE
+
+  # ========================================================================
+  # SNS NOTIFICATION
+  # ========================================================================
+  OverageNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-usage-notifications"
+      DisplayName: Kiro Usage Notifications
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # ========================================================================
+  # LAMBDA FUNCTION
+  # ========================================================================
+  ProcessReportsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ProcessReportsS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-s3-read-write"
+      Roles:
+        - !Ref ProcessReportsLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub
+                - "arn:aws:s3:::${Bucket}"
+                - Bucket: !If
+                    - CreateNewBucket
+                    - !Ref KiroReportBucket
+                    - !Ref BucketName
+              - !Sub
+                - "arn:aws:s3:::${Bucket}/*"
+                - Bucket: !If
+                    - CreateNewBucket
+                    - !Ref KiroReportBucket
+                    - !Ref BucketName
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub
+                - "arn:aws:s3:::${Bucket}/${ReportPrefix}/reports/*"
+                - Bucket: !If
+                    - CreateNewBucket
+                    - !Ref KiroReportBucket
+                    - !Ref BucketName
+
+  ProcessReportsSNSPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-sns-publish"
+      Roles:
+        - !Ref ProcessReportsLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref OverageNotificationTopic
+
+  ProcessReportsDynamoDBPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-dynamodb-rw"
+      Roles:
+        - !Ref ProcessReportsLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:Query
+            Resource: !GetAtt UsageTable.Arn
+
+  ProcessReportsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-process-kiro-reports"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessReportsLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BUCKET_NAME: !If
+            - CreateNewBucket
+            - !Ref KiroReportBucket
+            - !Ref BucketName
+          REPORT_PREFIX: !Ref ReportPrefix
+          SNS_TOPIC_ARN: !Ref OverageNotificationTopic
+          KIRO_REGION: !Ref KiroProfileRegion
+          TABLE_NAME: !Ref UsageTable
+          CONSOLE_SETTINGS_URL: !Sub "https://${KiroProfileRegion}.console.aws.amazon.com/amazonq/developer/home?region=${KiroProfileRegion}#/settings"
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import os
+          from datetime import datetime, timedelta
+          from io import StringIO
+          from decimal import Decimal
+          from boto3.dynamodb.conditions import Key
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          table = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+
+          # Live Kiro pricing (see https://kiro.dev/pricing/)
+          TIER_LIMITS = {'Pro': 1000, 'Pro+': 2000, 'Pro Max': 5000, 'Power': 10000}
+          TIER_PRICE = {'Pro': 20, 'Pro+': 40, 'Pro Max': 100, 'Power': 200}
+          OVERAGE_RATE = 0.04
+          TIER_ORDER = ['Pro', 'Pro+', 'Pro Max', 'Power']
+          TIER_MAP = {
+              'PRO': 'Pro', 'PRO+': 'Pro+', 'PROPLUS': 'Pro+',
+              'PRO MAX': 'Pro Max', 'PROMAX': 'Pro Max',
+              'POWER': 'Power',
+          }
+
+          def normalize_tier(raw):
+              key = (raw or '').strip().upper()
+              # Try exact match first, then collapsed spaces
+              return TIER_MAP.get(key) or TIER_MAP.get(key.replace(' ', ''), 'Pro')
+
+          def tier_cost(tier, credits):
+              """Total monthly cost on a tier for the given usage: base + overage."""
+              return TIER_PRICE[tier] + max(0, credits - TIER_LIMITS[tier]) * OVERAGE_RATE
+
+          def is_end_of_month_window(date):
+              """Return True if date is within the last 5 days of its month."""
+              import calendar
+              _, days_in_month = calendar.monthrange(date.year, date.month)
+              return date.day > (days_in_month - 5)
+
+          def upgrade_recommendation(tier, credits):
+              """Recommend upgrading when a lower tier's overage makes a higher tier cheaper."""
+              if tier not in TIER_ORDER:
+                  return None
+              current_cost = tier_cost(tier, credits)
+              higher = TIER_ORDER[TIER_ORDER.index(tier) + 1:]
+              candidates = [(t, tier_cost(t, credits)) for t in higher]
+              candidates = [(t, c) for t, c in candidates if c <= current_cost]
+              if not candidates:
+                  return None
+              best_tier, best_cost = min(candidates, key=lambda x: x[1])
+              savings = current_cost - best_cost
+              if savings < 0.005:
+                  return f"Upgrade to {best_tier} (same cost, more allowance)"
+              return f"Upgrade to {best_tier} (saves ${savings:.2f}/mo)"
+
+          def downgrade_recommendation(tier, credits):
+              """Recommend downgrading when a lower tier (even with overage) is cheaper.
+
+              Only called during the end-of-month window (last 5 days) so MTD
+              usage is a reliable proxy for the full month.
+              """
+              if tier not in TIER_ORDER:
+                  return None
+              idx = TIER_ORDER.index(tier)
+              if idx == 0:
+                  return None  # Already on the lowest paid tier
+              current_cost = tier_cost(tier, credits)
+              lower = TIER_ORDER[:idx]
+              candidates = [(t, tier_cost(t, credits)) for t in lower]
+              candidates = [(t, c) for t, c in candidates if c < current_cost]
+              if not candidates:
+                  return None
+              best_tier, best_cost = min(candidates, key=lambda x: x[1])
+              savings = current_cost - best_cost
+              if savings < 0.005:
+                  return None
+              return f"Downgrade to {best_tier} next month (saves ${savings:.2f}/mo)"
+
+          def cost_recommendation(tier, credits, end_of_month):
+              """Unified recommendation: upgrade, downgrade (if end-of-month), or None."""
+              up = upgrade_recommendation(tier, credits)
+              if up:
+                  return up
+              if end_of_month:
+                  down = downgrade_recommendation(tier, credits)
+                  if down:
+                      return down
+              return None
+
+          def send_missing_report_alert(bucket, prefix, sns_topic, console_url):
+              """Send an SNS alert when no reports are found in S3."""
+              message = (
+                  "ACTION REQUIRED: Kiro User Activity Reports Not Detected\n"
+                  + ("=" * 60) + "\n\n"
+                  "The Kiro Cost Optimizer Lambda ran but could not find any\n"
+                  "user activity reports in S3 for the expected date.\n\n"
+                  "Possible causes:\n"
+                  "  - The 'Kiro user activity reports' feature is not enabled\n"
+                  "  - The S3 bucket policy was removed or modified\n"
+                  "  - No Kiro users were active on the reporting day\n"
+                  "  - A Kiro service-side delivery issue\n\n"
+                  "To verify or enable the feature:\n"
+                  f"  1. Open: {console_url}\n"
+                  "  2. Under 'Kiro user activity reports', click Edit\n"
+                  "  3. Ensure 'Collect granular metrics per user' is toggled ON\n"
+                  f"  4. Confirm S3 URI is: s3://{bucket}/{prefix}/\n"
+                  "  5. Click Save\n\n"
+                  "Reports are delivered at 2:00 AM UTC daily. This alert will\n"
+                  "repeat every day until reports resume.\n"
+              )
+              sns.publish(
+                  TopicArn=sns_topic,
+                  Subject="ACTION REQUIRED: Kiro User Activity Reports Missing",
+                  Message=message,
+              )
+
+          def list_report_keys(bucket, base_prefix):
+              """Return all report CSV keys under base_prefix (handles pagination)."""
+              keys = []
+              token = None
+              while True:
+                  kwargs = {'Bucket': bucket, 'Prefix': base_prefix}
+                  if token:
+                      kwargs['ContinuationToken'] = token
+                  resp = s3.list_objects_v2(**kwargs)
+                  for obj in resp.get('Contents', []):
+                      if obj['Key'].endswith('.csv'):
+                          keys.append(obj['Key'])
+                  if resp.get('IsTruncated'):
+                      token = resp.get('NextContinuationToken')
+                  else:
+                      break
+              return keys
+
+          def report_date_from_key(key, base_prefix):
+              """Extract the data date (.../YYYY/MM/DD/HH/file.csv) from a report key."""
+              rest = key[len(base_prefix):].split('/')
+              if len(rest) >= 3:
+                  try:
+                      return datetime.strptime('/'.join(rest[:3]), '%Y/%m/%d')
+                  except ValueError:
+                      return None
+              return None
+
+          # Sort-key sentinel for the per-month user roster item. The roster
+          # lives in the SAME table under UserId="ROSTER#YYYY-MM", Date=ROSTER_SK.
+          # It records every user active anywhere in the month so the daily run
+          # can report month-to-date for ALL of them -- not just the users in the
+          # day being processed -- without scanning the whole table.
+          ROSTER_SK = "#ROSTER"
+
+          def roster_pk(month):
+              """Roster partition key for a month prefix ("YYYY-MM-")."""
+              return f"ROSTER#{month[:-1]}"
+
+          def read_month_roster(month):
+              """Return the set of user IDs recorded in this month's roster (or empty)."""
+              items = table.query(
+                  KeyConditionExpression=(
+                      Key('UserId').eq(roster_pk(month)) & Key('Date').eq(ROSTER_SK)
+                  )
+              )['Items']
+              if not items:
+                  return set()
+              return set(items[0].get('Users', []) or [])
+
+          def merge_month_roster(month, users):
+              """Union `users` into this month's roster (read-modify-write) and
+              return the full set. Skips the write when the union is empty
+              (DynamoDB string sets cannot be empty). Safe under the single
+              daily invocation (no concurrent writers)."""
+              merged = read_month_roster(month) | set(users)
+              if merged:
+                  table.put_item(Item={
+                      'UserId': roster_pk(month),
+                      'Date': ROSTER_SK,
+                      'Users': merged,
+                  })
+              return merged
+
+          def send_processing_error_alert(sns_topic, error):
+              """Notify via SNS when report processing fails unexpectedly."""
+              message = (
+                  "ERROR: Kiro Cost Optimizer report processing failed\n"
+                  + ("=" * 60) + "\n\n"
+                  "The processing Lambda raised an unexpected error while\n"
+                  "ingesting or processing the Kiro user activity report.\n\n"
+                  f"Error: {error}\n\n"
+                  "No report was archived or sent for this run. Check the\n"
+                  "CloudWatch Logs for the function for the full traceback.\n"
+              )
+              sns.publish(
+                  TopicArn=sns_topic,
+                  Subject="ERROR: Kiro Cost Optimizer processing failed",
+                  Message=message,
+              )
+
+          def lambda_handler(event, context):
+              # Top-level guard: report processing (ingest -> DynamoDB ->
+              # accumulate -> archive) runs in _process. Any unexpected failure
+              # is reported to SNS so it does not fail silently, then re-raised
+              # so Lambda records the invocation as failed (metrics / retries).
+              sns_topic = os.environ['SNS_TOPIC_ARN']
+              try:
+                  return _process(event, context)
+              except Exception as e:
+                  print(f"Processing failed: {e}")
+                  send_processing_error_alert(sns_topic, e)
+                  raise
+
+          def _process(event, context):
+              bucket = os.environ['BUCKET_NAME']
+              prefix = os.environ['REPORT_PREFIX']
+              sns_topic = os.environ['SNS_TOPIC_ARN']
+              region = os.environ['KIRO_REGION']
+              console_url = os.environ['CONSOLE_SETTINGS_URL']
+
+              # Target date: from event {"date": "YYYY-MM-DD"} for backfill, else yesterday
+              if event and event.get('date'):
+                  target = datetime.strptime(event['date'], '%Y-%m-%d')
+              else:
+                  target = datetime.utcnow() - timedelta(days=1)
+
+              account_id = context.invoked_function_arn.split(':')[4]
+
+              # ── REPORT DISCOVERY (with carry-forward) ──────────────────────
+              # List every available report and map it to its data date. Kiro
+              # delivers separate CSVs per client type (IDE, CLI) so we collect
+              # ALL keys per date and merge them during ingestion.
+              base_prefix = (
+                  f"{prefix}/AWSLogs/{account_id}/KiroLogs/"
+                  f"user_report/{region}/"
+              )
+              dated = {}
+              for key in list_report_keys(bucket, base_prefix):
+                  d = report_date_from_key(key, base_prefix)
+                  if d is None:
+                      continue
+                  dated.setdefault(d, []).append(key)
+
+              # Only truly missing data (feature never enabled, bucket policy
+              # removed, etc.) should trigger the admin alert.
+              target_day = datetime(target.year, target.month, target.day)
+              candidates = [d for d in dated if d <= target_day]
+              if not candidates:
+                  print(f"No reports on or before {target_day:%Y-%m-%d} - sending alert")
+                  send_missing_report_alert(bucket, prefix, sns_topic, console_url)
+                  return {
+                      'statusCode': 404,
+                      'body': 'No reports on or before target - alert sent',
+                      'report_missing': True,
+                  }
+
+              # ── PROCESS REPORTS ────────────────────────────────────────────
+              data_date = max(candidates)
+              is_stale = data_date != target_day
+              report_keys = dated[data_date]
+              if is_stale:
+                  print(
+                      f"No report for {target_day:%Y-%m-%d}; carrying forward "
+                      f"{data_date:%Y-%m-%d}: {len(report_keys)} file(s)"
+                  )
+              else:
+                  print(f"Processing {len(report_keys)} file(s) for {data_date:%Y-%m-%d}")
+
+              # Read all CSVs for the date and accumulate per-user totals.
+              # Multiple files (e.g. KIRO_CLI + KIRO_IDE) contain the same user
+              # with usage split by client type; we sum credits across files
+              # before writing a single consolidated row to DynamoDB.
+              user_accum = {}  # user_id -> {fields}
+              for report_key in report_keys:
+                  print(f"  Reading: s3://{bucket}/{report_key}")
+                  obj = s3.get_object(Bucket=bucket, Key=report_key)
+                  reader = csv.DictReader(StringIO(obj['Body'].read().decode('utf-8')))
+                  for row in reader:
+                      user_id = row.get('UserId', '')
+                      if not user_id:
+                          continue
+                      credits = Decimal(row.get('Credits_Used') or '0')
+                      overage = Decimal(row.get('Overage_Credits_Used') or '0')
+                      if user_id in user_accum:
+                          user_accum[user_id]['Credits_Used'] += credits
+                          user_accum[user_id]['Overage_Credits_Used'] += overage
+                      else:
+                          user_accum[user_id] = {
+                              'Date': row.get('Date', ''),
+                              'User_Email': row.get('User_Email', ''),
+                              'Subscription_Tier': row.get('Subscription_Tier', ''),
+                              'Credits_Used': credits,
+                              'Overage_Credits_Used': overage,
+                          }
+
+              user_ids = set()
+              for user_id, fields in user_accum.items():
+                  user_ids.add(user_id)
+                  table.put_item(Item={
+                      'UserId': user_id,
+                      'Date': fields['Date'],
+                      'User_Email': fields['User_Email'],
+                      'Subscription_Tier': fields['Subscription_Tier'],
+                      'Credits_Used': fields['Credits_Used'],
+                      'Overage_Credits_Used': fields['Overage_Credits_Used'],
+                  })
+
+              # Accumulate per user for the data date's MONTH (resets on the 1st)
+              month = f"{data_date:%Y-%m}-"
+              end_of_month = is_end_of_month_window(data_date)
+
+              # Record today's users in the month roster, then accumulate over
+              # EVERY user active anywhere in the month so far. Iterating only the
+              # users in the day being processed would drop everyone whose last
+              # activity was on an earlier day -- so a day with a single active
+              # user would render a single-user month-to-date report. The roster
+              # is one small item per month (keyed by UserId="ROSTER#YYYY-MM"),
+              # so this stays scoped to the current month with no full-table scan.
+              month_users = merge_month_roster(month, user_ids)
+
+              # Build a record per user (cells for rendering + sort metadata)
+              TIER_RANK = {'Power': 0, 'Pro Max': 1, 'Pro+': 2, 'Pro': 3}
+              records = []
+              for user_id in month_users:
+                  items = table.query(
+                      KeyConditionExpression=(
+                          Key('UserId').eq(user_id) & Key('Date').begins_with(month)
+                      )
+                  )['Items']
+                  if not items:
+                      continue
+                  latest = items[-1]
+                  total_credits = float(sum(i['Credits_Used'] for i in items))
+                  total_overage = float(sum(i['Overage_Credits_Used'] for i in items))
+                  tier = normalize_tier(latest.get('Subscription_Tier', ''))
+                  rec = cost_recommendation(tier, total_credits, end_of_month)
+                  records.append({
+                      'cells': [
+                          latest.get('User_Email') or user_id,
+                          latest.get('Subscription_Tier', ''),
+                          f"{total_credits:.2f}",
+                          f"{total_overage:.2f}",
+                          rec or '-',
+                      ],
+                      'tier': tier,
+                      'credits': total_credits,
+                      'has_rec': rec is not None,
+                  })
+
+              # Within a section: group by tier (Power, Pro+, Pro), heaviest first
+              def section_key(rec):
+                  return (TIER_RANK.get(rec['tier'], 99), -rec['credits'])
+
+              cost_opt_recs = sorted(
+                  (r for r in records if r['has_rec']), key=section_key
+              )
+              other_users = sorted(
+                  (r for r in records if not r['has_rec']), key=section_key
+              )
+
+              # Compute total estimated savings across all recommendations
+              total_savings = 0.0
+              for r in cost_opt_recs:
+                  rec_text = r['cells'][4]
+                  # Extract dollar amount from "... (saves $X.XX/mo)"
+                  if 'saves $' in rec_text:
+                      try:
+                          total_savings += float(rec_text.split('saves $')[1].split('/mo')[0])
+                      except (IndexError, ValueError):
+                          pass
+
+              # ── RENDER PLAIN-TEXT REPORT ───────────────────────────────────
+              headers = ['User', 'Tier', 'MTD Credits', 'MTD Overage', 'Recommendation']
+              aligns = ['l', 'l', 'r', 'r', 'l']
+              widths = [len(h) for h in headers]
+              for r in records:
+                  for i, cell in enumerate(r['cells']):
+                      widths[i] = max(widths[i], len(str(cell)))
+
+              def fmt_row(cells):
+                  parts = []
+                  for i, c in enumerate(cells):
+                      s = str(c)
+                      parts.append(
+                          s.rjust(widths[i]) if aligns[i] == 'r' else s.ljust(widths[i])
+                      )
+                  return ' | '.join(parts)
+
+              separator = '-+-'.join('-' * w for w in widths)
+
+              def render_section(title, recs):
+                  out = [title]
+                  if not recs:
+                      out.append("(none)")
+                      return out
+                  out.append(fmt_row(headers))
+                  out.append(separator)
+                  out += [fmt_row(r['cells']) for r in recs]
+                  return out
+
+              data_note = (
+                  f"Data as of: {data_date:%Y-%m-%d} (UTC)"
+                  + (f"  (carried forward - no new report for {target_day:%Y-%m-%d})"
+                     if is_stale else "")
+              )
+              lines = [
+                  f"Kiro Usage Report - {target:%Y-%m-%d}",
+                  f"Month-to-date accumulation ({data_date:%Y-%m})",
+                  data_note,
+                  f"Total users: {len(records)}",
+                  f"Total estimated savings: ${total_savings:.2f}/mo",
+                  "",
+              ]
+              lines += render_section(
+                  f"=== Cost Optimization Recommendations ({len(cost_opt_recs)} user(s)) ===",
+                  cost_opt_recs,
+              )
+              lines.append("")
+              lines += render_section(
+                  f"=== All Other Users ({len(other_users)} user(s)) ===",
+                  other_users,
+              )
+              report = "\n".join(lines) + "\n"
+
+              # Archive the report to S3. SNS delivery is handled separately by
+              # the EmailNotificationLambda, which reads this archived report
+              # from S3 on its own schedule. This function only ingests,
+              # processes, and archives. (The missing-report admin alert above
+              # is the one exception that still notifies directly from here.)
+              now = datetime.utcnow()
+              report_key = (
+                  f"{prefix}/reports/{now:%Y}/{now:%m}/"
+                  f"usage-report-{now:%Y-%m-%d-%H%M%S}.txt"
+              )
+              s3.put_object(Bucket=bucket, Key=report_key, Body=report)
+              print(f"Archived report: s3://{bucket}/{report_key}")
+
+              return {
+                  'statusCode': 200,
+                  'body': f'Processed {len(user_ids)} users',
+                  'data_date': f'{data_date:%Y-%m-%d}',
+                  'carried_forward': is_stale,
+              }
+
+  # ========================================================================
+  # EMAIL NOTIFICATION LAMBDA (reads the latest archived report from S3
+  # and publishes it to SNS, on the NotificationFrequency schedule)
+  # ========================================================================
+  EmailNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-process-kiro-notification"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessReportsLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !If
+            - CreateNewBucket
+            - !Ref KiroReportBucket
+            - !Ref BucketName
+          REPORT_PREFIX: !Ref ReportPrefix
+          SNS_TOPIC_ARN: !Ref OverageNotificationTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def find_latest_report(bucket, reports_prefix):
+              """Return the key of the most recent archived report (.txt), or None.
+
+              Archived reports are keyed as
+                {REPORT_PREFIX}/reports/YYYY/MM/usage-report-YYYY-MM-DD-HHMMSS.txt
+              which sorts lexicographically in chronological order, so the
+              lexically-largest .txt key is the newest report.
+              """
+              latest = None
+              token = None
+              while True:
+                  kwargs = {'Bucket': bucket, 'Prefix': reports_prefix}
+                  if token:
+                      kwargs['ContinuationToken'] = token
+                  resp = s3.list_objects_v2(**kwargs)
+                  for obj in resp.get('Contents', []):
+                      key = obj['Key']
+                      if key.endswith('.txt') and (latest is None or key > latest):
+                          latest = key
+                  if resp.get('IsTruncated'):
+                      token = resp.get('NextContinuationToken')
+                  else:
+                      break
+              return latest
+
+          def lambda_handler(event, context):
+              bucket = os.environ['BUCKET_NAME']
+              prefix = os.environ['REPORT_PREFIX']
+              sns_topic = os.environ['SNS_TOPIC_ARN']
+
+              # Reports are archived under {REPORT_PREFIX}/reports/YYYY/MM/.
+              reports_prefix = f"{prefix}/reports/"
+              latest_key = find_latest_report(bucket, reports_prefix)
+              if latest_key is None:
+                  print(
+                      f"No archived reports found under "
+                      f"s3://{bucket}/{reports_prefix} - nothing to send"
+                  )
+                  return {'statusCode': 404, 'body': 'No archived report to send'}
+
+              print(f"Publishing archived report: s3://{bucket}/{latest_key}")
+              report = (
+                  s3.get_object(Bucket=bucket, Key=latest_key)['Body']
+                  .read().decode('utf-8')
+              )
+
+              # Use the report's first line as the email subject (SNS caps
+              # subjects at 100 chars). Falls back to a generic subject.
+              first_line = report.splitlines()[0] if report.strip() else "Kiro Usage Report"
+              sns.publish(
+                  TopicArn=sns_topic,
+                  Subject=first_line[:100],
+                  Message=report,
+              )
+              return {'statusCode': 200, 'body': f'Sent {latest_key}'}
+
+  # ========================================================================
+  # ONE-TIME INSTALL BACKFILL (Custom Resource + Lambda)
+  # Seeds DynamoDB with the current month's daily rows (1st -> yesterday) so a
+  # mid-month install against an EXISTING bucket has correct month-to-date
+  # totals on the next scheduled processing run. Reuses ProcessReportsLambdaRole
+  # (already has s3:ListBucket / s3:GetObject / dynamodb:PutItem). Self-ingests
+  # only (no render/archive); the daily process + notification flow produces the
+  # reports. Best-effort: never fails the stack.
+  # ========================================================================
+  BackfillLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-process-kiro-backfill"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessReportsLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !If
+            - CreateNewBucket
+            - !Ref KiroReportBucket
+            - !Ref BucketName
+          REPORT_PREFIX: !Ref ReportPrefix
+          KIRO_REGION: !Ref KiroProfileRegion
+          TABLE_NAME: !Ref UsageTable
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import os
+          from datetime import datetime, timedelta
+          from io import StringIO
+          from decimal import Decimal
+          from boto3.dynamodb.conditions import Key
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+          table = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+
+          # Live Kiro pricing (see https://kiro.dev/pricing/). Mirrors the
+          # process-kiro-reports Lambda so the install-time report is identical
+          # in format and recommendations to the daily one.
+          TIER_LIMITS = {'Pro': 1000, 'Pro+': 2000, 'Pro Max': 5000, 'Power': 10000}
+          TIER_PRICE = {'Pro': 20, 'Pro+': 40, 'Pro Max': 100, 'Power': 200}
+          OVERAGE_RATE = 0.04
+          TIER_ORDER = ['Pro', 'Pro+', 'Pro Max', 'Power']
+          TIER_MAP = {
+              'PRO': 'Pro', 'PRO+': 'Pro+', 'PROPLUS': 'Pro+',
+              'PRO MAX': 'Pro Max', 'PROMAX': 'Pro Max',
+              'POWER': 'Power',
+          }
+
+          def list_report_keys(bucket, base_prefix):
+              """Return all report CSV keys under base_prefix (handles pagination)."""
+              keys = []
+              token = None
+              while True:
+                  kwargs = {'Bucket': bucket, 'Prefix': base_prefix}
+                  if token:
+                      kwargs['ContinuationToken'] = token
+                  resp = s3.list_objects_v2(**kwargs)
+                  for obj in resp.get('Contents', []):
+                      if obj['Key'].endswith('.csv'):
+                          keys.append(obj['Key'])
+                  if resp.get('IsTruncated'):
+                      token = resp.get('NextContinuationToken')
+                  else:
+                      break
+              return keys
+
+          def report_date_from_key(key, base_prefix):
+              """Extract the data date (.../YYYY/MM/DD/HH/file.csv) from a report key."""
+              rest = key[len(base_prefix):].split('/')
+              if len(rest) >= 3:
+                  try:
+                      return datetime.strptime('/'.join(rest[:3]), '%Y/%m/%d')
+                  except ValueError:
+                      return None
+              return None
+
+          # Sort-key sentinel for the per-month user roster item (must match the
+          # process-kiro-reports Lambda). The roster lives in the SAME table under
+          # UserId="ROSTER#YYYY-MM", Date=ROSTER_SK, and records every user active
+          # in the month so the daily run can report month-to-date for ALL of
+          # them. Backfill writes it so the first scheduled run after a mid-month
+          # install starts from the complete user set instead of an empty roster.
+          ROSTER_SK = "#ROSTER"
+
+          def roster_pk(month):
+              """Roster partition key for a month prefix ("YYYY-MM-")."""
+              return f"ROSTER#{month[:-1]}"
+
+          def read_month_roster(month):
+              """Return the set of user IDs recorded in this month's roster (or empty)."""
+              items = table.query(
+                  KeyConditionExpression=(
+                      Key('UserId').eq(roster_pk(month)) & Key('Date').eq(ROSTER_SK)
+                  )
+              )['Items']
+              if not items:
+                  return set()
+              return set(items[0].get('Users', []) or [])
+
+          def merge_month_roster(month, users):
+              """Union `users` into this month's roster (read-modify-write) and
+              return the full set. Skips the write when the union is empty
+              (DynamoDB string sets cannot be empty)."""
+              merged = read_month_roster(month) | set(users)
+              if merged:
+                  table.put_item(Item={
+                      'UserId': roster_pk(month),
+                      'Date': ROSTER_SK,
+                      'Users': merged,
+                  })
+              return merged
+
+          def ingest_keys(bucket, keys):
+              """Read multiple report CSVs for a single date and write consolidated
+              per-user rows to DynamoDB. Kiro delivers separate CSVs per client
+              type (IDE, CLI); this merges them by summing credits per user.
+
+              Idempotent: put_item overwrites on (UserId, Date). Uses put_item
+              (granted by the shared role) rather than batch_writer/BatchWriteItem.
+              """
+              user_accum = {}
+              for key in keys:
+                  print(f"  Reading: s3://{bucket}/{key}")
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  reader = csv.DictReader(StringIO(obj['Body'].read().decode('utf-8')))
+                  for row in reader:
+                      user_id = row.get('UserId', '')
+                      if not user_id:
+                          continue
+                      credits = Decimal(row.get('Credits_Used') or '0')
+                      overage = Decimal(row.get('Overage_Credits_Used') or '0')
+                      if user_id in user_accum:
+                          user_accum[user_id]['Credits_Used'] += credits
+                          user_accum[user_id]['Overage_Credits_Used'] += overage
+                      else:
+                          user_accum[user_id] = {
+                              'Date': row.get('Date', ''),
+                              'User_Email': row.get('User_Email', ''),
+                              'Subscription_Tier': row.get('Subscription_Tier', ''),
+                              'Credits_Used': credits,
+                              'Overage_Credits_Used': overage,
+                          }
+              rows = 0
+              users = set()
+              for user_id, fields in user_accum.items():
+                  users.add(user_id)
+                  table.put_item(Item={
+                      'UserId': user_id,
+                      'Date': fields['Date'],
+                      'User_Email': fields['User_Email'],
+                      'Subscription_Tier': fields['Subscription_Tier'],
+                      'Credits_Used': fields['Credits_Used'],
+                      'Overage_Credits_Used': fields['Overage_Credits_Used'],
+                  })
+                  rows += 1
+              return rows, users
+
+          def normalize_tier(raw):
+              key = (raw or '').strip().upper()
+              return TIER_MAP.get(key) or TIER_MAP.get(key.replace(' ', ''), 'Pro')
+
+          def tier_cost(tier, credits):
+              """Total monthly cost on a tier for the given usage: base + overage."""
+              return TIER_PRICE[tier] + max(0, credits - TIER_LIMITS[tier]) * OVERAGE_RATE
+
+          def is_end_of_month_window(date):
+              """Return True if date is within the last 5 days of its month."""
+              import calendar
+              _, days_in_month = calendar.monthrange(date.year, date.month)
+              return date.day > (days_in_month - 5)
+
+          def upgrade_recommendation(tier, credits):
+              """Recommend upgrading when a lower tier's overage makes a higher tier cheaper."""
+              if tier not in TIER_ORDER:
+                  return None
+              current_cost = tier_cost(tier, credits)
+              higher = TIER_ORDER[TIER_ORDER.index(tier) + 1:]
+              candidates = [(t, tier_cost(t, credits)) for t in higher]
+              candidates = [(t, c) for t, c in candidates if c <= current_cost]
+              if not candidates:
+                  return None
+              best_tier, best_cost = min(candidates, key=lambda x: x[1])
+              savings = current_cost - best_cost
+              if savings < 0.005:
+                  return f"Upgrade to {best_tier} (same cost, more allowance)"
+              return f"Upgrade to {best_tier} (saves ${savings:.2f}/mo)"
+
+          def downgrade_recommendation(tier, credits):
+              """Recommend downgrading when a lower tier (even with overage) is cheaper.
+
+              Only called during the end-of-month window (last 5 days) so MTD
+              usage is a reliable proxy for the full month.
+              """
+              if tier not in TIER_ORDER:
+                  return None
+              idx = TIER_ORDER.index(tier)
+              if idx == 0:
+                  return None  # Already on the lowest paid tier
+              current_cost = tier_cost(tier, credits)
+              lower = TIER_ORDER[:idx]
+              candidates = [(t, tier_cost(t, credits)) for t in lower]
+              candidates = [(t, c) for t, c in candidates if c < current_cost]
+              if not candidates:
+                  return None
+              best_tier, best_cost = min(candidates, key=lambda x: x[1])
+              savings = current_cost - best_cost
+              if savings < 0.005:
+                  return None
+              return f"Downgrade to {best_tier} next month (saves ${savings:.2f}/mo)"
+
+          def cost_recommendation(tier, credits, end_of_month):
+              """Unified recommendation: upgrade, downgrade (if end-of-month), or None."""
+              up = upgrade_recommendation(tier, credits)
+              if up:
+                  return up
+              if end_of_month:
+                  down = downgrade_recommendation(tier, credits)
+                  if down:
+                      return down
+              return None
+
+          def build_and_archive_report(bucket, prefix, data_date, user_ids):
+              """Accumulate MTD totals from DynamoDB and archive a .txt report to S3.
+
+              Mirrors the process-kiro-reports Lambda's accumulate -> render ->
+              archive flow. Reports month-to-date totals (scoped to data_date's
+              calendar month) for EVERY user seeded during the backfill -- i.e.
+              everyone active anywhere in the month so far, not just the most
+              recent day -- so the install report reflects the whole month rather
+              than a single day's snapshot. Returns the archived S3 key.
+              """
+              month = f"{data_date:%Y-%m}-"
+              end_of_month = is_end_of_month_window(data_date)
+              TIER_RANK = {'Power': 0, 'Pro Max': 1, 'Pro+': 2, 'Pro': 3}
+              records = []
+              for user_id in user_ids:
+                  items = table.query(
+                      KeyConditionExpression=(
+                          Key('UserId').eq(user_id) & Key('Date').begins_with(month)
+                      )
+                  )['Items']
+                  if not items:
+                      continue
+                  latest = items[-1]
+                  total_credits = float(sum(i['Credits_Used'] for i in items))
+                  total_overage = float(sum(i['Overage_Credits_Used'] for i in items))
+                  tier = normalize_tier(latest.get('Subscription_Tier', ''))
+                  rec = cost_recommendation(tier, total_credits, end_of_month)
+                  records.append({
+                      'cells': [
+                          latest.get('User_Email') or user_id,
+                          latest.get('Subscription_Tier', ''),
+                          f"{total_credits:.2f}",
+                          f"{total_overage:.2f}",
+                          rec or '-',
+                      ],
+                      'tier': tier,
+                      'credits': total_credits,
+                      'has_rec': rec is not None,
+                  })
+
+              def section_key(rec):
+                  return (TIER_RANK.get(rec['tier'], 99), -rec['credits'])
+
+              cost_opt_recs = sorted((r for r in records if r['has_rec']), key=section_key)
+              other_users = sorted((r for r in records if not r['has_rec']), key=section_key)
+
+              total_savings = 0.0
+              for r in cost_opt_recs:
+                  rec_text = r['cells'][4]
+                  if 'saves $' in rec_text:
+                      try:
+                          total_savings += float(rec_text.split('saves $')[1].split('/mo')[0])
+                      except (IndexError, ValueError):
+                          pass
+
+              headers = ['User', 'Tier', 'MTD Credits', 'MTD Overage', 'Recommendation']
+              aligns = ['l', 'l', 'r', 'r', 'l']
+              widths = [len(h) for h in headers]
+              for r in records:
+                  for i, cell in enumerate(r['cells']):
+                      widths[i] = max(widths[i], len(str(cell)))
+
+              def fmt_row(cells):
+                  parts = []
+                  for i, c in enumerate(cells):
+                      s = str(c)
+                      parts.append(
+                          s.rjust(widths[i]) if aligns[i] == 'r' else s.ljust(widths[i])
+                      )
+                  return ' | '.join(parts)
+
+              separator = '-+-'.join('-' * w for w in widths)
+
+              def render_section(title, recs):
+                  out = [title]
+                  if not recs:
+                      out.append("(none)")
+                      return out
+                  out.append(fmt_row(headers))
+                  out.append(separator)
+                  out += [fmt_row(r['cells']) for r in recs]
+                  return out
+
+              lines = [
+                  f"Kiro Usage Report - {data_date:%Y-%m-%d}",
+                  f"Month-to-date accumulation ({data_date:%Y-%m})",
+                  f"Data as of: {data_date:%Y-%m-%d} (UTC)  (install backfill)",
+                  f"Total users: {len(records)}",
+                  f"Total estimated savings: ${total_savings:.2f}/mo",
+                  "",
+              ]
+              lines += render_section(
+                  f"=== Cost Optimization Recommendations ({len(cost_opt_recs)} user(s)) ===",
+                  cost_opt_recs,
+              )
+              lines.append("")
+              lines += render_section(
+                  f"=== All Other Users ({len(other_users)} user(s)) ===",
+                  other_users,
+              )
+              report = "\n".join(lines) + "\n"
+
+              now = datetime.utcnow()
+              report_key = (
+                  f"{prefix}/reports/{now:%Y}/{now:%m}/"
+                  f"usage-report-{now:%Y-%m-%d-%H%M%S}.txt"
+              )
+              s3.put_object(Bucket=bucket, Key=report_key, Body=report)
+              print(f"Archived install report: s3://{bucket}/{report_key}")
+              return report_key
+
+          def do_backfill(context):
+              """Seed every available report from the 1st of this month to yesterday."""
+              bucket = os.environ['BUCKET_NAME']
+              prefix = os.environ['REPORT_PREFIX']
+              region = os.environ['KIRO_REGION']
+              account_id = context.invoked_function_arn.split(':')[4]
+
+              today = datetime.utcnow()
+              first_of_month = datetime(today.year, today.month, 1)
+              yesterday = datetime(today.year, today.month, today.day) - timedelta(days=1)
+
+              base_prefix = (
+                  f"{prefix}/AWSLogs/{account_id}/KiroLogs/"
+                  f"user_report/{region}/"
+              )
+              # Map data date -> list of keys, restricted to this month, <= yesterday.
+              # Kiro delivers separate CSVs per client type (IDE, CLI) so we
+              # collect ALL keys per date and merge them during ingestion.
+              dated = {}
+              for key in list_report_keys(bucket, base_prefix):
+                  d = report_date_from_key(key, base_prefix)
+                  if d is None:
+                      continue
+                  if first_of_month <= d <= yesterday:
+                      dated.setdefault(d, []).append(key)
+
+              days = sorted(dated)
+              rows = 0
+              all_users = set()
+              for d in days:
+                  print(f"Backfilling {d:%Y-%m-%d}: {len(dated[d])} file(s)")
+                  n, users = ingest_keys(bucket, dated[d])
+                  rows += n
+                  all_users |= users
+
+              # After seeding DynamoDB, produce an immediate month-to-date report
+              # (same format as the daily process Lambda) and archive it to S3,
+              # so the admin gets a report right after install instead of waiting
+              # for the notification schedule. The report accumulates the WHOLE
+              # month for every user seeded above (not just the most recent day),
+              # using the latest seeded data date as the "as of" date.
+              report_key = None
+              if all_users:
+                  data_date = max(days)
+                  # Mirror the daily Lambda: record every seeded user in this
+                  # month's roster so the first scheduled process run reports
+                  # month-to-date for ALL of them, instead of only the next day's
+                  # active users (which would otherwise re-trigger the original
+                  # "single-user report" bug right after a mid-month install).
+                  merge_month_roster(f"{data_date:%Y-%m}-", all_users)
+                  report_key = build_and_archive_report(
+                      bucket, prefix, data_date, all_users
+                  )
+              return len(days), rows, report_key
+
+          def _skip_reason(props):
+              """Return a reason string to skip the backfill, or None to proceed."""
+              if str(props.get('UseExistingBucket', 'false')).lower() != 'true':
+                  return "UseExistingBucket != true: new bucket has no history"
+              if datetime.utcnow().day == 1:
+                  return "1st of month: nothing delivered yet"
+              return None
+
+          def _run_backfill(context):
+              days, rows, report_key = do_backfill(context)
+              result = {'days_seeded': days, 'rows_written': rows}
+              if report_key:
+                  result['report_key'] = report_key
+              print(f"Backfill complete: {result}")
+              return result
+
+          def lambda_handler(event, context):
+              # Dual-mode entry point:
+              #  * CloudFormation custom resource: the event carries 'ResponseURL'.
+              #    Runs best-effort (never rolls back the stack) and signals CFN.
+              #  * Standalone / manual invocation (console "Test", CLI invoke, etc.):
+              #    no 'ResponseURL'. Runs the backfill directly and RETURNS the
+              #    result without calling cfnresponse (which is what caused the
+              #    KeyError: 'ResponseURL'). By default a manual run is forced
+              #    (bypassing the UseExistingBucket / 1st-of-month skips). Pass
+              #    {"force": false} to exercise the normal skip logic, and
+              #    {"UseExistingBucket": "true"} to set the property.
+              if 'ResponseURL' not in event:
+                  props = event.get('ResourceProperties') or {
+                      'UseExistingBucket': event.get('UseExistingBucket', 'true')
+                  }
+                  force = str(event.get('force', 'true')).lower() == 'true'
+                  skip = None if force else _skip_reason(props)
+                  if skip:
+                      print(f"Skipping backfill: {skip}")
+                      return {'skipped': skip}
+                  return _run_backfill(context)
+
+              # CloudFormation custom resource path (best-effort, Create-only).
+              request_type = event.get('RequestType')
+              props = event.get('ResourceProperties', {})
+              result = {}
+              try:
+                  if request_type in ('Delete', 'Update'):
+                      print(f"RequestType={request_type}: no-op (Create-only)")
+                  else:
+                      skip = _skip_reason(props)
+                      if skip:
+                          print(f"Skipping backfill: {skip}")
+                      else:
+                          result = _run_backfill(context)
+              except Exception as e:
+                  # Best-effort: log loudly but do not fail/roll back the stack.
+                  print(f"Backfill error (non-fatal): {e}")
+                  result = {'error': str(e)}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, result)
+
+  BackfillCustomResource:
+    Type: Custom::Backfill
+    DependsOn:
+      - UsageTable
+      - ProcessReportsS3Policy
+      - ProcessReportsDynamoDBPolicy
+    Properties:
+      ServiceToken: !GetAtt BackfillLambda.Arn
+      UseExistingBucket: !Ref UseExistingBucket
+
+  # ========================================================================
+  # EVENTBRIDGE SCHEDULER
+  # ========================================================================
+  DailyProcessingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-process-kiro-reports"
+      Description: Triggers Lambda to process Kiro reports daily at 3 AM UTC
+      ScheduleExpression: "cron(0 3 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProcessReportsLambda.Arn
+          Id: ProcessReportsLambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessReportsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyProcessingRule.Arn
+
+  EmailNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-process-kiro-notification"
+      Description: >
+        Triggers the notification Lambda daily, weekly, or monthly
+        based on the NotificationFrequency parameter.
+      ScheduleExpression: !FindInMap [FrequencyToCron, !Ref NotificationFrequency, Cron]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EmailNotificationLambda.Arn
+          Id: EmailNotificationLambdaTarget
+
+  EmailNotificationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmailNotificationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EmailNotificationRule.Arn
+
+Outputs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # MANUAL STEP: These outputs guide the admin to enable the feature
+  # ──────────────────────────────────────────────────────────────────────────
+  ManualStepConsoleUrl:
+    Description: >
+      REQUIRED MANUAL STEP - Open this URL to enable Kiro user activity reports.
+      Toggle ON 'Collect granular metrics per user' and paste the ReportS3Uri below.
+    Value: !Sub "https://${KiroProfileRegion}.console.aws.amazon.com/amazonq/developer/home?region=${KiroProfileRegion}#/settings"
+
+  BucketName:
+    Description: S3 bucket for Kiro user activity reports
+    Value: !If
+      - CreateNewBucket
+      - !Ref KiroReportBucket
+      - !Ref BucketName
+
+  ReportS3Uri:
+    Description: >
+      Paste this S3 URI in the Kiro console settings under 'S3 location'
+    Value: !If
+      - CreateNewBucket
+      - !Sub "s3://${KiroReportBucket}/${ReportPrefix}/"
+      - !Sub "s3://${BucketName}/${ReportPrefix}/"
+
+  RequiredBucketPolicyStatement:
+    Description: >
+      If you chose UseExistingBucket=true, add this statement to your
+      existing bucket policy to allow Kiro to deliver reports.
+    Value: !Sub |
+      {
+        "Sid": "KiroUserActivityReportWrite",
+        "Effect": "Allow",
+        "Principal": { "Service": "q.amazonaws.com" },
+        "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::${BucketName}/${ReportPrefix}/*",
+        "Condition": {
+          "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
+          "ArnLike": { "aws:SourceArn": "arn:aws:codewhisperer:${KiroProfileRegion}:${AWS::AccountId}:*" }
+        }
+      }
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda processor function
+    Value: !GetAtt ProcessReportsLambda.Arn
+
+  EmailNotificationLambdaArn:
+    Description: ARN of the scheduled email notification Lambda
+    Value: !GetAtt EmailNotificationLambda.Arn
+
+  BackfillLambdaArn:
+    Description: ARN of the one-time install backfill Lambda
+    Value: !GetAtt BackfillLambda.Arn
+
+  EmailNotificationSchedule:
+    Description: Resolved cron expression for the email notification Lambda
+    Value: !FindInMap [FrequencyToCron, !Ref NotificationFrequency, Cron]
+
+  SNSTopicArn:
+    Description: ARN of the SNS notification topic
+    Value: !Ref OverageNotificationTopic
+
+  UsageTableName:
+    Description: DynamoDB table storing daily per-user usage
+    Value: !Ref UsageTable
