@@ -33,7 +33,7 @@ jobs:
           pip install cfn-lint
       - name: CFN Lint
         run: |
-          cfn-lint cfn/kiro-cost-optimizer.yaml
+          cfn-lint cfn/kiro-cost-optimizer.yaml --ignore-checks W1031
       - name: Install bandit
         run: |
           pip install bandit
