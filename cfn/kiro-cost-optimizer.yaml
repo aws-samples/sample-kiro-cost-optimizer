@@ -319,6 +319,49 @@ Resources:
               # Try exact match first, then collapsed spaces
               return TIER_MAP.get(key) or TIER_MAP.get(key.replace(' ', ''), 'Pro')
 
+          # Suffix on per-model message-count columns (e.g. "auto_messages",
+          # "claude_opus_5_messages"). The model name is the header prefix.
+          MODEL_COL_SUFFIX = '_messages'
+
+          def extract_models(row):
+              """Return the set of model names the user used in this CSV row.
+
+              Any column whose header ends in "_messages" is a per-model message
+              count; the model name is the header prefix ("auto_messages" ->
+              "auto", "claude_opus_5_messages" -> "claude_opus_5", which includes
+              Kiro's auto model picker). A model is counted only when its cell
+              parses to a number > 0, so models untouched that day are skipped.
+              Blank / non-numeric cells are ignored.
+              """
+              models = set()
+              for header, value in row.items():
+                  if not header or not header.endswith(MODEL_COL_SUFFIX):
+                      continue
+                  model = header[:-len(MODEL_COL_SUFFIX)]
+                  if not model:
+                      continue
+                  try:
+                      count = float(value)
+                  except (TypeError, ValueError):
+                      continue
+                  if count > 0:
+                      models.add(model)
+              return models
+
+          def fmt_clients(client_types):
+              """Comma-separated, sorted client types with the KIRO_ prefix
+              stripped (e.g. {"KIRO_WEB","KIRO_CLI"} -> "CLI, WEB"). Empty -> "-"."""
+              names = sorted(
+                  ct[len('KIRO_'):] if ct.startswith('KIRO_') else ct
+                  for ct in client_types
+              )
+              return ', '.join(names) if names else '-'
+
+          def fmt_models(models):
+              """Comma-separated, sorted model names (empty -> "-")."""
+              names = sorted(models)
+              return ', '.join(names) if names else '-'
+
           def tier_cost(tier, credits):
               """Total monthly cost on a tier for the given usage: base + overage."""
               return TIER_PRICE[tier] + max(0, credits - TIER_LIMITS[tier]) * OVERAGE_RATE
@@ -570,9 +613,17 @@ Resources:
                           continue
                       credits = Decimal(row.get('Credits_Used') or '0')
                       overage = Decimal(row.get('Overage_Credits_Used') or '0')
+                      # Client type (col C) and per-model usage are unioned into
+                      # sets across every client-type CSV for this user/day.
+                      client_type = (row.get('Client_Type') or '').strip()
+                      models = extract_models(row)
                       if user_id in user_accum:
-                          user_accum[user_id]['Credits_Used'] += credits
-                          user_accum[user_id]['Overage_Credits_Used'] += overage
+                          acc = user_accum[user_id]
+                          acc['Credits_Used'] += credits
+                          acc['Overage_Credits_Used'] += overage
+                          if client_type:
+                              acc['ClientTypes'].add(client_type)
+                          acc['Models'] |= models
                       else:
                           user_accum[user_id] = {
                               'Date': row.get('Date', ''),
@@ -580,19 +631,28 @@ Resources:
                               'Subscription_Tier': row.get('Subscription_Tier', ''),
                               'Credits_Used': credits,
                               'Overage_Credits_Used': overage,
+                              'ClientTypes': {client_type} if client_type else set(),
+                              'Models': models,
                           }
 
               user_ids = set()
               for user_id, fields in user_accum.items():
                   user_ids.add(user_id)
-                  table.put_item(Item={
+                  # DynamoDB string sets cannot be empty, so ClientTypes/Models
+                  # are only written when non-empty (same rule as the roster).
+                  item = {
                       'UserId': user_id,
                       'Date': fields['Date'],
                       'User_Email': fields['User_Email'],
                       'Subscription_Tier': fields['Subscription_Tier'],
                       'Credits_Used': fields['Credits_Used'],
                       'Overage_Credits_Used': fields['Overage_Credits_Used'],
-                  })
+                  }
+                  if fields['ClientTypes']:
+                      item['ClientTypes'] = fields['ClientTypes']
+                  if fields['Models']:
+                      item['Models'] = fields['Models']
+                  table.put_item(Item=item)
 
               # Accumulate per user for the data date's MONTH (resets on the 1st)
               month = f"{data_date:%Y-%m}-"
@@ -621,14 +681,22 @@ Resources:
                   latest = items[-1]
                   total_credits = float(sum(i['Credits_Used'] for i in items))
                   total_overage = float(sum(i['Overage_Credits_Used'] for i in items))
+                  # Union client types + models across every day in the month.
+                  client_types = set()
+                  models = set()
+                  for i in items:
+                      client_types |= set(i.get('ClientTypes') or [])
+                      models |= set(i.get('Models') or [])
                   tier = normalize_tier(latest.get('Subscription_Tier', ''))
                   rec = cost_recommendation(tier, total_credits, end_of_month)
                   records.append({
                       'cells': [
                           latest.get('User_Email') or user_id,
                           latest.get('Subscription_Tier', ''),
+                          fmt_clients(client_types),
                           f"{total_credits:.2f}",
                           f"{total_overage:.2f}",
+                          fmt_models(models),
                           rec or '-',
                       ],
                       'tier': tier,
@@ -650,7 +718,7 @@ Resources:
               # Compute total estimated savings across all recommendations
               total_savings = 0.0
               for r in cost_opt_recs:
-                  rec_text = r['cells'][4]
+                  rec_text = r['cells'][-1]
                   # Extract dollar amount from "... (saves $X.XX/mo)"
                   if 'saves $' in rec_text:
                       try:
@@ -659,8 +727,8 @@ Resources:
                           pass
 
               # ── RENDER PLAIN-TEXT REPORT ───────────────────────────────────
-              headers = ['User', 'Tier', 'MTD Credits', 'MTD Overage', 'Recommendation']
-              aligns = ['l', 'l', 'r', 'r', 'l']
+              headers = ['User', 'Tier', 'Clients', 'MTD Credits', 'MTD Overage', 'Models', 'Recommendation']
+              aligns = ['l', 'l', 'l', 'r', 'r', 'l', 'l']
               widths = [len(h) for h in headers]
               for r in records:
                   for i, cell in enumerate(r['cells']):
@@ -953,9 +1021,17 @@ Resources:
                           continue
                       credits = Decimal(row.get('Credits_Used') or '0')
                       overage = Decimal(row.get('Overage_Credits_Used') or '0')
+                      # Client type (col C) and per-model usage are unioned into
+                      # sets across every client-type CSV for this user/day.
+                      client_type = (row.get('Client_Type') or '').strip()
+                      models = extract_models(row)
                       if user_id in user_accum:
-                          user_accum[user_id]['Credits_Used'] += credits
-                          user_accum[user_id]['Overage_Credits_Used'] += overage
+                          acc = user_accum[user_id]
+                          acc['Credits_Used'] += credits
+                          acc['Overage_Credits_Used'] += overage
+                          if client_type:
+                              acc['ClientTypes'].add(client_type)
+                          acc['Models'] |= models
                       else:
                           user_accum[user_id] = {
                               'Date': row.get('Date', ''),
@@ -963,25 +1039,76 @@ Resources:
                               'Subscription_Tier': row.get('Subscription_Tier', ''),
                               'Credits_Used': credits,
                               'Overage_Credits_Used': overage,
+                              'ClientTypes': {client_type} if client_type else set(),
+                              'Models': models,
                           }
               rows = 0
               users = set()
               for user_id, fields in user_accum.items():
                   users.add(user_id)
-                  table.put_item(Item={
+                  # DynamoDB string sets cannot be empty, so ClientTypes/Models
+                  # are only written when non-empty (same rule as the roster).
+                  item = {
                       'UserId': user_id,
                       'Date': fields['Date'],
                       'User_Email': fields['User_Email'],
                       'Subscription_Tier': fields['Subscription_Tier'],
                       'Credits_Used': fields['Credits_Used'],
                       'Overage_Credits_Used': fields['Overage_Credits_Used'],
-                  })
+                  }
+                  if fields['ClientTypes']:
+                      item['ClientTypes'] = fields['ClientTypes']
+                  if fields['Models']:
+                      item['Models'] = fields['Models']
+                  table.put_item(Item=item)
                   rows += 1
               return rows, users
 
           def normalize_tier(raw):
               key = (raw or '').strip().upper()
               return TIER_MAP.get(key) or TIER_MAP.get(key.replace(' ', ''), 'Pro')
+
+          # Suffix on per-model message-count columns (must match the
+          # process-kiro-reports Lambda). The model name is the header prefix.
+          MODEL_COL_SUFFIX = '_messages'
+
+          def extract_models(row):
+              """Return the set of model names the user used in this CSV row.
+
+              Any column whose header ends in "_messages" is a per-model message
+              count; the model name is the header prefix ("auto_messages" ->
+              "auto", which includes Kiro's auto model picker). A model is counted
+              only when its cell parses to a number > 0. Blank / non-numeric cells
+              are ignored.
+              """
+              models = set()
+              for header, value in row.items():
+                  if not header or not header.endswith(MODEL_COL_SUFFIX):
+                      continue
+                  model = header[:-len(MODEL_COL_SUFFIX)]
+                  if not model:
+                      continue
+                  try:
+                      count = float(value)
+                  except (TypeError, ValueError):
+                      continue
+                  if count > 0:
+                      models.add(model)
+              return models
+
+          def fmt_clients(client_types):
+              """Comma-separated, sorted client types with the KIRO_ prefix
+              stripped (e.g. {"KIRO_WEB","KIRO_CLI"} -> "CLI, WEB"). Empty -> "-"."""
+              names = sorted(
+                  ct[len('KIRO_'):] if ct.startswith('KIRO_') else ct
+                  for ct in client_types
+              )
+              return ', '.join(names) if names else '-'
+
+          def fmt_models(models):
+              """Comma-separated, sorted model names (empty -> "-")."""
+              names = sorted(models)
+              return ', '.join(names) if names else '-'
 
           def tier_cost(tier, credits):
               """Total monthly cost on a tier for the given usage: base + overage."""
@@ -1068,14 +1195,22 @@ Resources:
                   latest = items[-1]
                   total_credits = float(sum(i['Credits_Used'] for i in items))
                   total_overage = float(sum(i['Overage_Credits_Used'] for i in items))
+                  # Union client types + models across every day in the month.
+                  client_types = set()
+                  models = set()
+                  for i in items:
+                      client_types |= set(i.get('ClientTypes') or [])
+                      models |= set(i.get('Models') or [])
                   tier = normalize_tier(latest.get('Subscription_Tier', ''))
                   rec = cost_recommendation(tier, total_credits, end_of_month)
                   records.append({
                       'cells': [
                           latest.get('User_Email') or user_id,
                           latest.get('Subscription_Tier', ''),
+                          fmt_clients(client_types),
                           f"{total_credits:.2f}",
                           f"{total_overage:.2f}",
+                          fmt_models(models),
                           rec or '-',
                       ],
                       'tier': tier,
@@ -1091,15 +1226,15 @@ Resources:
 
               total_savings = 0.0
               for r in cost_opt_recs:
-                  rec_text = r['cells'][4]
+                  rec_text = r['cells'][-1]
                   if 'saves $' in rec_text:
                       try:
                           total_savings += float(rec_text.split('saves $')[1].split('/mo')[0])
                       except (IndexError, ValueError):
                           pass
 
-              headers = ['User', 'Tier', 'MTD Credits', 'MTD Overage', 'Recommendation']
-              aligns = ['l', 'l', 'r', 'r', 'l']
+              headers = ['User', 'Tier', 'Clients', 'MTD Credits', 'MTD Overage', 'Models', 'Recommendation']
+              aligns = ['l', 'l', 'l', 'r', 'r', 'l', 'l']
               widths = [len(h) for h in headers]
               for r in records:
                   for i, cell in enumerate(r['cells']):
