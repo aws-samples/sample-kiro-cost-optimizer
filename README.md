@@ -1,6 +1,3 @@
-# Publish Date 
-August 05, 2026
-
 # Kiro Cost Optimizer
 
 Automated cost optimization for **Kiro Enterprise**. Ingests daily per-user activity reports (IDE + CLI + WEB), accumulates month-to-date credit usage per user, and emails tier upgrade/downgrade recommendations on a configurable daily, weekly, or monthly schedule.
@@ -54,7 +51,7 @@ Click the SNS subscription confirmation link sent to your inbox. Reports begin a
 
 Kiro Enterprise delivers daily usage reports to S3 at 2:00 AM UTC, split by client type (`KIRO_IDE_*.csv`,`KIRO_WEB_*.csv`, `KIRO_CLI_*.csv`). At 3:00 AM UTC the `process-kiro-reports` Lambda:
 
-- **Merges** all CSVs for the target date, summing `Credits_Used` and `Overage_Credits_Used` per user across client types. If no report exists for the date, the most recent prior report is carried forward (labelled accordingly).
+- **Merges** all CSVs for the target date, summing `Credits_Used` and `Overage_Credits_Used` per user across client types and unioning the **client types** (`Client_Type`, e.g. `KIRO_WEB`, `KIRO_CLI`, `KIRO_IDE`) and **models** each user touched. Models are read from every per-model column (any header ending in `_messages`, e.g. `auto_messages`, `claude_opus_5_messages`); the model name is the header prefix and a model counts only when its message count is above zero. If no report exists for the date, the most recent prior report is carried forward (labelled accordingly).
 - **Persists** one consolidated row per user per day to DynamoDB (idempotent) and **accumulates** per-user month-to-date totals across a per-month user roster, so users active earlier in the month still appear on days they had no usage. The roster resets on the 1st.
 - **Archives** the rendered report to S3 (`<ReportPrefix>/reports/YYYY/MM/`) and **alerts** the admin via SNS if no report exists on or before the target date, or if processing fails.
 
@@ -72,7 +69,7 @@ Kiro delivers reports with separate CSVs per client type:
 {ReportPrefix}/AWSLogs/{AccountId}/KiroLogs/user_report/{Region}/YYYY/MM/DD/HH/KIRO_{ClientType}_{AccountId}_user_report_YYYYMMDDHHNN.csv
 ```
 
-The Lambda collects **all** `.csv` files for a date and sums credits per user across client types before writing a single consolidated row to DynamoDB. Processed reports are archived under `{ReportPrefix}/reports/YYYY/MM/usage-report-YYYY-MM-DD-HHMMSS.txt`.
+The Lambda collects **all** `.csv` files for a date and sums credits per user across client types before writing a single consolidated row to DynamoDB. Each row also stores the set of **client types** and **models** the user used that day (as DynamoDB string sets `ClientTypes` and `Models`), which are unioned across the month for the report. Processed reports are archived under `{ReportPrefix}/reports/YYYY/MM/usage-report-YYYY-MM-DD-HHMMSS.txt`.
 
 ## Tier Limits & Pricing Logic
 
@@ -142,6 +139,10 @@ aws logs tail /aws/lambda/kiro-cost-optimizer-process-kiro-reports --follow
 
 The email is split into two sections: users with a recommendation first, then everyone else. Within each, users are grouped by tier (Power → Pro+ → Pro) and sorted by MTD credits descending.
 
+The **Clients** column lists the client types the user was active on (`KIRO_` prefix stripped: `WEB`, `CLI`, `IDE`); the **Models** column lists the models they used (including `auto`, Kiro's automatic model picker). Both are comma-separated within a single cell. Models sits second-to-last (just before Recommendation) since its length varies the most, keeping the numeric columns aligned on the left.
+
+> Note: the email is plain text with fixed-width columns, so it renders best in a monospace font. Some mail clients (e.g. Outlook with a default proportional font) may misalign the columns; the archived S3 report is the same content and renders correctly in any monospace viewer.
+
 ```
 Subject: Kiro Usage Report (2026-06-05) - 4 user(s)
 
@@ -152,14 +153,14 @@ Total users: 4
 Total estimated savings: $64.00/mo
 
 === Cost Optimization Recommendations (2 user(s)) ===
-User                | Tier | MTD Credits | MTD Overage | Recommendation
---------------------+------+-------------+-------------+-----------------------------------
-bob@example.com     | PRO+ |     7000.00 |     5000.00 | Upgrade to Power (saves $40.00/mo)
-alice@example.com   | PRO  |     2100.00 |     1100.00 | Upgrade to Pro+ (saves $24.00/mo)
+User              | Tier | Clients  | MTD Credits | MTD Overage | Models                       | Recommendation
+------------------+------+----------+-------------+-------------+------------------------------+-----------------------------------
+bob@example.com   | PRO+ | CLI, WEB |     7000.00 |     5000.00 | auto, claude_sonnet_5        | Upgrade to Power (saves $40.00/mo)
+alice@example.com | PRO  | IDE      |     2100.00 |     1100.00 | auto, claude_opus_5          | Upgrade to Pro+ (saves $24.00/mo)
 
 === All Other Users (2 user(s)) ===
-carol@example.com   | POWER |     8200.00 |        0.00 | -
-dave@example.com    | PRO   |      450.00 |        0.00 | -
+carol@example.com | POWER | IDE, WEB |     8200.00 |        0.00 | auto, claude_opus_5, gpt_5.6 | -
+dave@example.com  | PRO   | CLI      |      450.00 |        0.00 | auto                         | -
 ```
 
 Variants:
