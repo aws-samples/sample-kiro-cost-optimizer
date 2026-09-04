@@ -174,6 +174,14 @@ Resources:
           KeyType: HASH
         - AttributeName: Date
           KeyType: RANGE
+      # Auto-expire rows 90 days after they are written so the table never
+      # grows unbounded, even if the operator forgets to clean up. TTL
+      # deletes are performed by DynamoDB itself (no IAM grant, no write
+      # cost) and are best-effort (within a few days of expiry). 90 days
+      # comfortably outlives the longest read window (the current month).
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAt
+        Enabled: true
 
   # ========================================================================
   # SNS NOTIFICATION
@@ -484,6 +492,16 @@ Resources:
           # day being processed -- without scanning the whole table.
           ROSTER_SK = "#ROSTER"
 
+          # Every item written to the table carries an ExpiresAt attribute so
+          # DynamoDB TTL auto-deletes it 90 days after it was written. 90 days
+          # outlives the longest read window (the current month) with margin,
+          # so no read ever loses data it still needs.
+          TTL_DAYS = 90
+
+          def ttl_90d():
+              """Epoch-second TTL timestamp: now + 90 days (write-time based)."""
+              return int((datetime.utcnow() + timedelta(days=TTL_DAYS)).timestamp())
+
           def roster_pk(month):
               """Roster partition key for a month prefix ("YYYY-MM-")."""
               return f"ROSTER#{month[:-1]}"
@@ -510,6 +528,7 @@ Resources:
                       'UserId': roster_pk(month),
                       'Date': ROSTER_SK,
                       'Users': merged,
+                      'ExpiresAt': ttl_90d(),
                   })
               return merged
 
@@ -652,6 +671,7 @@ Resources:
                       item['ClientTypes'] = fields['ClientTypes']
                   if fields['Models']:
                       item['Models'] = fields['Models']
+                  item['ExpiresAt'] = ttl_90d()
                   table.put_item(Item=item)
 
               # Accumulate per user for the data date's MONTH (resets on the 1st)
@@ -974,6 +994,16 @@ Resources:
           # install starts from the complete user set instead of an empty roster.
           ROSTER_SK = "#ROSTER"
 
+          # Every item written to the table carries an ExpiresAt attribute so
+          # DynamoDB TTL auto-deletes it 90 days after it was written (must
+          # match the process-kiro-reports Lambda). 90 days outlives the
+          # longest read window (the current month) with margin.
+          TTL_DAYS = 90
+
+          def ttl_90d():
+              """Epoch-second TTL timestamp: now + 90 days (write-time based)."""
+              return int((datetime.utcnow() + timedelta(days=TTL_DAYS)).timestamp())
+
           def roster_pk(month):
               """Roster partition key for a month prefix ("YYYY-MM-")."""
               return f"ROSTER#{month[:-1]}"
@@ -999,6 +1029,7 @@ Resources:
                       'UserId': roster_pk(month),
                       'Date': ROSTER_SK,
                       'Users': merged,
+                      'ExpiresAt': ttl_90d(),
                   })
               return merged
 
@@ -1060,6 +1091,7 @@ Resources:
                       item['ClientTypes'] = fields['ClientTypes']
                   if fields['Models']:
                       item['Models'] = fields['Models']
+                  item['ExpiresAt'] = ttl_90d()
                   table.put_item(Item=item)
                   rows += 1
               return rows, users
