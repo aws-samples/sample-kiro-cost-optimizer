@@ -33,8 +33,8 @@ Parameters:
       Set to "true" if you already have an S3 bucket with user activity
       reports enabled. When true, provide the bucket name below — the stack
       will NOT modify your existing bucket policy. You must manually add the
-      required policy statement (shown in the stack outputs after creation).
-      When false, a new bucket is created with the correct policy attached.
+      required policy statement (shown in the stack outputs after creation) and optional S3 lifecycle configuration.
+      When false, a new bucket is created with the correct policy attached and S3 lifecycle configuration.
 
   BucketName:
     Type: String
@@ -125,14 +125,16 @@ Resources:
         Status: Enabled
       LifecycleConfiguration:
         Rules:
-          - Id: TransitionToIA
+          # 90-day retention on this stack's own .txt reports, matched to the
+          # DynamoDB TTL. Bucket is versioned, so NoncurrentVersionExpiration
+          # (1 day, not 90) is what actually deletes the bytes.
+          - Id: ExpireRenderedReports
             Status: Enabled
-            Prefix: !Sub "${ReportPrefix}/"
-            Transitions:
-              - StorageClass: STANDARD_IA
-                TransitionInDays: 30
-              - StorageClass: GLACIER
-                TransitionInDays: 90
+            Filter:
+              Prefix: !Sub "${ReportPrefix}/reports/"
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
 
   KiroReportBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -370,6 +372,18 @@ Resources:
               names = sorted(models)
               return ', '.join(names) if names else '-'
 
+          def fmt_usage_pct(raw_tier, credits):
+              """MTD credits as a percentage of the tier's monthly allowance
+              (e.g. Pro at 900/1000 -> "90.0%"). Can exceed 100% when overage
+              is enabled. Returns "-" for an unrecognized tier rather than
+              silently measuring against the Pro default used by normalize_tier.
+              Display-only: does not feed the recommendation logic."""
+              key = (raw_tier or '').strip().upper()
+              tier = TIER_MAP.get(key) or TIER_MAP.get(key.replace(' ', ''))
+              if tier is None:
+                  return '-'
+              return f"{credits / TIER_LIMITS[tier] * 100:.1f}%"
+
           def tier_cost(tier, credits):
               """Total monthly cost on a tier for the given usage: base + overage."""
               return TIER_PRICE[tier] + max(0, credits - TIER_LIMITS[tier]) * OVERAGE_RATE
@@ -379,6 +393,16 @@ Resources:
               import calendar
               _, days_in_month = calendar.monthrange(date.year, date.month)
               return date.day > (days_in_month - 5)
+
+          def fmt_month_elapsed(date):
+              """How far through its month the data date is, e.g. "day 15 of 30,
+              50.0% elapsed". Each daily report covers the whole data date, so
+              day N counts as complete. Lets readers compare a user's Usage %
+              against the share of the month that has passed."""
+              import calendar
+              _, days_in_month = calendar.monthrange(date.year, date.month)
+              pct = date.day / days_in_month * 100
+              return f"day {date.day} of {days_in_month}, {pct:.1f}% elapsed"
 
           def upgrade_recommendation(tier, credits):
               """Recommend upgrading when a lower tier's overage makes a higher tier cheaper."""
@@ -715,6 +739,7 @@ Resources:
                           latest.get('Subscription_Tier', ''),
                           fmt_clients(client_types),
                           f"{total_credits:.2f}",
+                          fmt_usage_pct(latest.get('Subscription_Tier', ''), total_credits),
                           f"{total_overage:.2f}",
                           fmt_models(models),
                           rec or '-',
@@ -747,8 +772,8 @@ Resources:
                           pass
 
               # ── RENDER PLAIN-TEXT REPORT ───────────────────────────────────
-              headers = ['User', 'Tier', 'Clients', 'MTD Credits', 'MTD Overage', 'Models', 'Recommendation']
-              aligns = ['l', 'l', 'l', 'r', 'r', 'l', 'l']
+              headers = ['User', 'Tier', 'Clients', 'MTD Credits', 'Usage %', 'MTD Overage', 'Models', 'Recommendation']
+              aligns = ['l', 'l', 'l', 'r', 'r', 'r', 'l', 'l']
               widths = [len(h) for h in headers]
               for r in records:
                   for i, cell in enumerate(r['cells']):
@@ -782,7 +807,7 @@ Resources:
               )
               lines = [
                   f"Kiro Usage Report - {target:%Y-%m-%d}",
-                  f"Month-to-date accumulation ({data_date:%Y-%m})",
+                  f"Month-to-date accumulation ({data_date:%Y-%m}; {fmt_month_elapsed(data_date)})",
                   data_note,
                   f"Total users: {len(records)}",
                   f"Total estimated savings: ${total_savings:.2f}/mo",
@@ -1142,6 +1167,16 @@ Resources:
               names = sorted(models)
               return ', '.join(names) if names else '-'
 
+          def fmt_usage_pct(raw_tier, credits):
+              """MTD credits as a percentage of the tier's monthly allowance
+              (must match the process-kiro-reports Lambda). Can exceed 100% when
+              overage is enabled; "-" for an unrecognized tier. Display-only."""
+              key = (raw_tier or '').strip().upper()
+              tier = TIER_MAP.get(key) or TIER_MAP.get(key.replace(' ', ''))
+              if tier is None:
+                  return '-'
+              return f"{credits / TIER_LIMITS[tier] * 100:.1f}%"
+
           def tier_cost(tier, credits):
               """Total monthly cost on a tier for the given usage: base + overage."""
               return TIER_PRICE[tier] + max(0, credits - TIER_LIMITS[tier]) * OVERAGE_RATE
@@ -1151,6 +1186,16 @@ Resources:
               import calendar
               _, days_in_month = calendar.monthrange(date.year, date.month)
               return date.day > (days_in_month - 5)
+
+          def fmt_month_elapsed(date):
+              """How far through its month the data date is, e.g. "day 15 of 30,
+              50.0% elapsed". Each daily report covers the whole data date, so
+              day N counts as complete. Lets readers compare a user's Usage %
+              against the share of the month that has passed."""
+              import calendar
+              _, days_in_month = calendar.monthrange(date.year, date.month)
+              pct = date.day / days_in_month * 100
+              return f"day {date.day} of {days_in_month}, {pct:.1f}% elapsed"
 
           def upgrade_recommendation(tier, credits):
               """Recommend upgrading when a lower tier's overage makes a higher tier cheaper."""
@@ -1241,6 +1286,7 @@ Resources:
                           latest.get('Subscription_Tier', ''),
                           fmt_clients(client_types),
                           f"{total_credits:.2f}",
+                          fmt_usage_pct(latest.get('Subscription_Tier', ''), total_credits),
                           f"{total_overage:.2f}",
                           fmt_models(models),
                           rec or '-',
@@ -1265,8 +1311,8 @@ Resources:
                       except (IndexError, ValueError):
                           pass
 
-              headers = ['User', 'Tier', 'Clients', 'MTD Credits', 'MTD Overage', 'Models', 'Recommendation']
-              aligns = ['l', 'l', 'l', 'r', 'r', 'l', 'l']
+              headers = ['User', 'Tier', 'Clients', 'MTD Credits', 'Usage %', 'MTD Overage', 'Models', 'Recommendation']
+              aligns = ['l', 'l', 'l', 'r', 'r', 'r', 'l', 'l']
               widths = [len(h) for h in headers]
               for r in records:
                   for i, cell in enumerate(r['cells']):
@@ -1295,7 +1341,7 @@ Resources:
 
               lines = [
                   f"Kiro Usage Report - {data_date:%Y-%m-%d}",
-                  f"Month-to-date accumulation ({data_date:%Y-%m})",
+                  f"Month-to-date accumulation ({data_date:%Y-%m}; {fmt_month_elapsed(data_date)})",
                   f"Data as of: {data_date:%Y-%m-%d} (UTC)  (install backfill)",
                   f"Total users: {len(records)}",
                   f"Total estimated savings: ${total_savings:.2f}/mo",
@@ -1526,6 +1572,35 @@ Outputs:
           "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
           "ArnLike": { "aws:SourceArn": "arn:aws:codewhisperer:${KiroProfileRegion}:${AWS::AccountId}:*" }
         }
+      }
+
+  OptionalS3LifecyclePolicy:
+    Description: >
+      If you chose UseExistingBucket=true, this stack does NOT apply any
+      lifecycle rule to your bucket. Optionally apply this rule yourself to
+      give the .txt reports written by this stack a 90-day rolling retention,
+      matching the DynamoDB TTL, so they do not accumulate indefinitely.
+      Scoped to the "reports/" prefix only (all nested YYYY/MM folders
+      included); it never touches the Kiro-delivered CSVs under "AWSLogs/".
+      On a versioned bucket, Expiration alone only writes a delete marker, so
+      NoncurrentVersionExpiration is what actually reclaims the storage a day
+      later, after which S3 removes the leftover delete marker automatically.
+      On a non-versioned bucket NoncurrentVersionExpiration has no effect and
+      Expiration deletes outright, so the same rule is safe either way.
+      WARNING - put-bucket-lifecycle-configuration REPLACES a bucket's entire
+      lifecycle configuration: if your bucket already has rules, merge this
+      one into them rather than applying it on its own.
+    Value: !Sub |
+      {
+        "Rules": [
+          {
+            "ID": "ExpireRenderedReports",
+            "Status": "Enabled",
+            "Filter": { "Prefix": "${ReportPrefix}/reports/" },
+            "Expiration": { "Days": 90 },
+            "NoncurrentVersionExpiration": { "NoncurrentDays": 1 }
+          }
+        ]
       }
 
   LambdaFunctionArn:

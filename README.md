@@ -59,7 +59,7 @@ A separate, independently scheduled `process-kiro-notification` Lambda reads the
 
 ## Architecture
 
-![Architecture Diagram](images/architecture.png)
+![Architecture Diagram](images/architecture.jpg)
 
 ## Report File Naming Convention
 
@@ -99,7 +99,7 @@ Use the same [Deploy](#deploy) command, overriding these two parameters:
       BucketName=my-existing-kiro-reports-bucket \
 ```
 
-After deployment, check the `RequiredBucketPolicyStatement` stack output for the policy statement to add to your bucket manually.
+After deployment, check the `RequiredBucketPolicyStatement` stack output for the policy statement to add to your bucket manually. The stack applies no lifecycle rule to an existing bucket; the `OptionalS3LifecyclePolicy` output supplies a ready-to-apply rule that expires this stack's reports after 90 days, scoped to `{ReportPrefix}/reports/` so your Kiro CSVs are untouched. Note that `put-bucket-lifecycle-configuration` replaces a bucket's entire lifecycle configuration — merge the rule into your existing rules rather than applying it standalone.
 
 ### Mid-month installs (backfill)
 
@@ -137,7 +137,9 @@ aws logs tail /aws/lambda/kiro-cost-optimizer-process-kiro-reports --follow
 
 ## Sample Output
 
-The email is split into two sections: users with a recommendation first, then everyone else. Within each, users are grouped by tier (Power → Pro+ → Pro) and sorted by MTD credits descending.
+The email is split into two sections: users with a recommendation first, then everyone else. Within each, users are grouped by tier (Power → Pro Max → Pro+ → Pro) and sorted by MTD credits descending, so the heaviest users stay on top.
+
+The Usage % column is MTD credits divided by the user's tier allowance (e.g. 900 of Pro's 1,000 = `90.0%`). It can exceed 100% when overage is enabled, and shows `-` if the tier in the report isn't recognized. The header line shows how far through the month the data is (e.g. `day 15 of 30, 50.0% elapsed`), so you can compare the two: a user at 70% on day 15 is on pace to exceed their allowance. Both are display-only and do not affect recommendations. They are useful when overage is disabled, because the recommendations are cost-based and only suggest upgrades for users who are paying overage.
 
 The Clients column lists the client types the user was active on (`KIRO_` prefix stripped: `WEB`, `CLI`, `IDE`); the Models column lists the models they used (including `auto`, Kiro's automatic model picker). Both are comma-separated within a single cell. Models sits second-to-last (just before Recommendation) since its length varies the most, keeping the numeric columns aligned on the left.
 
@@ -147,20 +149,22 @@ The Clients column lists the client types the user was active on (`KIRO_` prefix
 Subject: Kiro Usage Report (2026-06-05) - 4 user(s)
 
 Kiro Usage Report - 2026-06-05
-Month-to-date accumulation (2026-06)
+Month-to-date accumulation (2026-06; day 5 of 30, 16.7% elapsed)
 Data as of: 2026-06-05 (UTC)
 Total users: 4
-Total estimated savings: $64.00/mo
+Total estimated savings: $80.00/mo
 
 === Cost Optimization Recommendations (2 user(s)) ===
-User              | Tier | Clients  | MTD Credits | MTD Overage | Models                       | Recommendation
-------------------+------+----------+-------------+-------------+------------------------------+-----------------------------------
-bob@example.com   | PRO+ | CLI, WEB |     7000.00 |     5000.00 | auto, claude_sonnet_5        | Upgrade to Power (saves $40.00/mo)
-alice@example.com | PRO  | IDE      |     2100.00 |     1100.00 | auto, claude_opus_5          | Upgrade to Pro+ (saves $24.00/mo)
+User              | Tier  | Clients  | MTD Credits | Usage % | MTD Overage | Models                       | Recommendation
+------------------+-------+----------+-------------+---------+-------------+------------------------------+-------------------------------------
+bob@example.com   | PRO+  | CLI, WEB |     7000.00 |  350.0% |     5000.00 | auto, claude_sonnet_5        | Upgrade to Pro Max (saves $60.00/mo)
+alice@example.com | PRO   | IDE      |     2100.00 |  210.0% |     1100.00 | auto, claude_opus_5          | Upgrade to Pro+ (saves $20.00/mo)
 
 === All Other Users (2 user(s)) ===
-carol@example.com | POWER | IDE, WEB |     8200.00 |        0.00 | auto, claude_opus_5, gpt_5.6 | -
-dave@example.com  | PRO   | CLI      |      450.00 |        0.00 | auto                         | -
+User              | Tier  | Clients  | MTD Credits | Usage % | MTD Overage | Models                       | Recommendation
+------------------+-------+----------+-------------+---------+-------------+------------------------------+-------------------------------------
+carol@example.com | POWER | IDE, WEB |     8200.00 |   82.0% |        0.00 | auto, claude_opus_5, gpt_5.6 | -
+dave@example.com  | PRO   | CLI      |      450.00 |   45.0% |        0.00 | auto                         | -
 ```
 
 Variants:
@@ -199,6 +203,8 @@ aws cloudformation delete-stack --stack-name kiro-cost-optimizer
 Removes the Lambdas, EventBridge rules, SNS topic, DynamoDB table, and (if the stack created it) the S3 bucket. An existing bucket (`UseExistingBucket=true`) and its contents are retained.
 
 Even without teardown, the DynamoDB table never grows unbounded: every row (per-user daily rows and the per-month user roster) is written with an `ExpiresAt` timestamp, and DynamoDB TTL auto-deletes each row 90 days after it was written. TTL deletes are performed by DynamoDB itself, so they incur no IAM permission or write cost, and are best-effort (typically within a few days of expiry). 90 days comfortably outlives the longest read window (the current month), so month-to-date reports are never affected. TTL deletion applies only to rows written after this feature was deployed; rows written earlier have no `ExpiresAt` and persist until removed manually or with the stack.
+
+The archived reports are bounded to match: when the stack creates the bucket, an `ExpireRenderedReports` lifecycle rule deletes each `.txt` under `{ReportPrefix}/reports/` 90 days after it is written, including every nested `YYYY/MM` folder. Because the bucket is versioned, expiration first writes a delete marker and `NoncurrentVersionExpiration` reclaims the bytes a day later, after which S3 removes the delete marker automatically. The rule applies no storage-class transitions (the reports are below S3's 128 KB transition threshold) and never touches the Kiro-delivered CSVs under `{ReportPrefix}/AWSLogs/`, which remain the customer's to manage. For `UseExistingBucket=true` no rule is applied — see [Using an existing bucket](#using-an-existing-bucket).
 
 ## Security
 
