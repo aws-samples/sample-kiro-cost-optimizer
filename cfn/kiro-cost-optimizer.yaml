@@ -130,8 +130,7 @@ Resources:
           # (1 day, not 90) is what actually deletes the bytes.
           - Id: ExpireRenderedReports
             Status: Enabled
-            Filter:
-              Prefix: !Sub "${ReportPrefix}/reports/"
+            Prefix: !Sub "${ReportPrefix}/reports/"
             ExpirationInDays: 90
             NoncurrentVersionExpiration:
               NoncurrentDays: 1
