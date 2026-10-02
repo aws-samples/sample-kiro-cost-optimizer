@@ -66,6 +66,9 @@ Parameters:
     Description: >
       The AWS Region where your Kiro profile was installed.
       Currently supported: us-east-1 and eu-central-1.
+      When UseExistingBucket is "false", deploy this stack in this same
+      Region (the new bucket is created in the stack's Region, and Kiro only
+      delivers reports to a bucket in the profile's Region).
 
   NotificationEmail:
     Type: String
@@ -83,6 +86,22 @@ Parameters:
       How often the email notification Lambda runs:
       "1" = daily, "7" = weekly (Mondays), "30" = monthly (1st of month).
       All runs fire at 8 AM UTC.
+
+Rules:
+  # A new bucket is always created in the stack's Region, but Kiro only
+  # delivers reports to a bucket in the Kiro profile's Region. Without this
+  # check a wrong-Region deploy succeeds and only surfaces later as the daily
+  # "Reports Missing" alert. Existing buckets are exempt: the stack can run
+  # in any Region and read a bucket in the Kiro profile's Region.
+  NewBucketMustBeInKiroProfileRegion:
+    RuleCondition: !Equals [!Ref UseExistingBucket, "false"]
+    Assertions:
+      - Assert: !Equals [!Ref KiroProfileRegion, !Ref "AWS::Region"]
+        AssertDescription: >
+          When UseExistingBucket is "false", deploy this stack in the same
+          Region as your Kiro profile (KiroProfileRegion). The new bucket is
+          created in the stack's Region, and Kiro only delivers reports to a
+          bucket in the profile's Region.
 
 Mappings:
   # Translates the NotificationFrequency parameter into an EventBridge cron.

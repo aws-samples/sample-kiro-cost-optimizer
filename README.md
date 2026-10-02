@@ -18,6 +18,7 @@ Automated cost optimization for **Kiro Enterprise**. Ingests daily per-user acti
 
 ```bash
 aws cloudformation deploy \
+  --region us-east-1 \
   --template-file cfn/kiro-cost-optimizer.yaml \
   --stack-name kiro-cost-optimizer \
   --parameter-overrides \
@@ -30,6 +31,8 @@ aws cloudformation deploy \
 ```
 
 `NotificationFrequency`: `1` = daily, `7` = weekly (Mondays), `30` = monthly (1st).
+
+`KiroProfileRegion` must be the Region where your Kiro profile was installed (`us-east-1` or `eu-central-1`). With `UseExistingBucket=false`, deploy the stack in that same Region (`--region`), because the new bucket is created in the stack's Region and Kiro only delivers reports to a bucket in the profile's Region. A mismatched deploy fails with a `Parameter validation failed` error before any resources are created, leaving an empty stack in `ROLLBACK_COMPLETE`; delete it (`aws cloudformation delete-stack`) and redeploy in the right Region. With `UseExistingBucket=true`, the stack can run in any Region, but the existing bucket must be in the Kiro profile's Region.
 
 ### Enable Reports in Kiro Console
 
