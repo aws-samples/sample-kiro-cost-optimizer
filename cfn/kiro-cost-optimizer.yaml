@@ -723,7 +723,6 @@ Resources:
                       continue
                   latest = items[-1]
                   total_credits = float(sum(i['Credits_Used'] for i in items))
-                  total_overage = float(sum(i['Overage_Credits_Used'] for i in items))
                   # Union client types + models across every day in the month.
                   client_types = set()
                   models = set()
@@ -731,6 +730,13 @@ Resources:
                       client_types |= set(i.get('ClientTypes') or [])
                       models |= set(i.get('Models') or [])
                   tier = normalize_tier(latest.get('Subscription_Tier', ''))
+                  # MTD overage is derived from MTD credits against the CURRENT
+                  # tier's allowance, not summed from the daily CSV
+                  # Overage_Credits_Used values. Per Kiro billing, a mid-month
+                  # upgrade is recalculated at cycle end under the new tier's
+                  # limit for the whole month, so overage recorded in earlier
+                  # CSVs (under the old tier) may never be billed.
+                  total_overage = max(0.0, total_credits - TIER_LIMITS[tier])
                   rec = cost_recommendation(tier, total_credits, end_of_month)
                   records.append({
                       'cells': [
@@ -1270,7 +1276,6 @@ Resources:
                       continue
                   latest = items[-1]
                   total_credits = float(sum(i['Credits_Used'] for i in items))
-                  total_overage = float(sum(i['Overage_Credits_Used'] for i in items))
                   # Union client types + models across every day in the month.
                   client_types = set()
                   models = set()
@@ -1278,6 +1283,13 @@ Resources:
                       client_types |= set(i.get('ClientTypes') or [])
                       models |= set(i.get('Models') or [])
                   tier = normalize_tier(latest.get('Subscription_Tier', ''))
+                  # MTD overage is derived from MTD credits against the CURRENT
+                  # tier's allowance, not summed from the daily CSV
+                  # Overage_Credits_Used values. Per Kiro billing, a mid-month
+                  # upgrade is recalculated at cycle end under the new tier's
+                  # limit for the whole month, so overage recorded in earlier
+                  # CSVs (under the old tier) may never be billed.
+                  total_overage = max(0.0, total_credits - TIER_LIMITS[tier])
                   rec = cost_recommendation(tier, total_credits, end_of_month)
                   records.append({
                       'cells': [
